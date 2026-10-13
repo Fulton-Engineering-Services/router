@@ -159,10 +159,12 @@ impl<'de> Deserialize<'de> for ChatMessage {
             }),
             "system" => Ok(ChatMessage::System {
                 role: role.to_string(),
-                content: value
-                    .get("content")
-                    .and_then(|content| serde_json::from_value(content.clone()).ok())
-                    .unwrap_or(UserMessageContent::Text(String::new())),
+                content: match value.get("content") {
+                    Some(content) => serde_json::from_value(content.clone()).map_err(|e| {
+                        D::Error::custom(format!("invalid system message content: {e}"))
+                    })?,
+                    None => UserMessageContent::Text(String::new()),
+                },
                 name: value.get("name").and_then(|n| {
                     if n.is_null() {
                         None
@@ -172,13 +174,14 @@ impl<'de> Deserialize<'de> for ChatMessage {
                 }),
             }),
             "user" => {
-                let content = value
-                    .get("content")
-                    .map(|c| {
-                        serde_json::from_value(c.clone())
-                            .unwrap_or(UserMessageContent::Text(String::new()))
-                    })
-                    .unwrap_or(UserMessageContent::Text(String::new()));
+                // An unsupported content-part kind must fail loudly, not
+                // silently collapse the whole prompt to an empty string.
+                let content = match value.get("content") {
+                    Some(c) => serde_json::from_value(c.clone()).map_err(|e| {
+                        D::Error::custom(format!("invalid user message content: {e}"))
+                    })?,
+                    None => UserMessageContent::Text(String::new()),
+                };
                 Ok(ChatMessage::User {
                     role: role.to_string(),
                     content,
@@ -295,6 +298,12 @@ pub enum ContentPart {
     Text { text: String },
     #[serde(rename = "image_url")]
     ImageUrl { image_url: ImageUrl },
+    #[serde(rename = "video_url")]
+    VideoUrl { video_url: VideoUrl },
+    #[serde(rename = "audio_url")]
+    AudioUrl { audio_url: AudioUrl },
+    #[serde(rename = "input_audio")]
+    InputAudio { input_audio: InputAudio },
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -302,6 +311,29 @@ pub struct ImageUrl {
     pub url: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub detail: Option<String>, // "auto", "low", or "high"
+}
+
+// Video/audio media parts mirror vLLM's accepted wire shapes
+// (vllm/entrypoints/chat_utils.py: ChatCompletionContentPartVideoParam,
+// ChatCompletionContentPartAudioParam, ChatCompletionContentPartInputAudioParam).
+// The PD router typed-re-serializes the request to both legs, so every part kind
+// the vLLM legs accept must round-trip here or it is lost.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct VideoUrl {
+    pub url: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub detail: Option<String>,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct AudioUrl {
+    pub url: String,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct InputAudio {
+    pub data: String,
+    pub format: String, // "wav" | "mp3"
 }
 
 // ============= Response Format Types =============
@@ -3997,6 +4029,47 @@ mod tests {
         let message: ChatMessage = serde_json::from_value(json.clone()).unwrap();
 
         assert_eq!(serde_json::to_value(message).unwrap(), json);
+    }
+
+    #[test]
+    fn test_chat_message_all_media_parts_round_trip() {
+        // Every content-part kind the vLLM legs accept (image_url, video_url,
+        // audio_url, input_audio) must survive the router's typed round-trip;
+        // the PD path re-serializes this struct to both legs.
+        let json = serde_json::json!({
+            "role": "user",
+            "content": [
+                {"type": "text", "text": "describe these"},
+                {"type": "image_url", "image_url": {"url": "data:image/png;base64,AAA", "detail": "high"}},
+                {"type": "video_url", "video_url": {"url": "data:video/mp4;base64,BBB"}},
+                {"type": "audio_url", "audio_url": {"url": "data:audio/wav;base64,CCC"}},
+                {"type": "input_audio", "input_audio": {"data": "DDD", "format": "wav"}}
+            ]
+        });
+
+        let message: ChatMessage = serde_json::from_value(json.clone()).unwrap();
+
+        assert_eq!(serde_json::to_value(message).unwrap(), json);
+    }
+
+    #[test]
+    fn test_chat_message_unknown_part_kind_is_rejected() {
+        // A genuinely unsupported part kind must fail deserialization rather
+        // than silently collapsing the whole content array to an empty string.
+        let json = serde_json::json!({
+            "role": "user",
+            "content": [
+                {"type": "text", "text": "hello"},
+                {"type": "bogus_part", "bogus_part": {"url": "x"}}
+            ]
+        });
+
+        let result: Result<ChatMessage, _> = serde_json::from_value(json);
+
+        assert!(
+            result.is_err(),
+            "unknown content-part kind must be rejected, got {result:?}"
+        );
     }
 
     #[test]

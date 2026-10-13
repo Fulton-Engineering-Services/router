@@ -5,6 +5,56 @@ mod test_pd_routing {
     };
     use vllm_router_rs::routers::RouterFactory;
 
+    // The PD router re-serializes the typed request to a JSON `Value`
+    // (`vllm_pd_router.rs` `route_chat` => `serde_json::to_value(body)`) and
+    // sends that identical body to BOTH the prefill and decode legs. This is
+    // the exact boundary where a content-part kind not present in the typed
+    // model would be silently lost. Assert every vLLM-accepted media part
+    // round-trips unchanged through it.
+    #[test]
+    fn pd_request_serialization_preserves_all_media_parts() {
+        use vllm_router_rs::protocols::spec::ChatCompletionRequest;
+
+        let body = serde_json::json!({
+            "model": "XiaomiMiMo/MiMo-V2.6-Flash-RL-EXL3",
+            "messages": [{
+                "role": "user",
+                "content": [
+                    {"type": "text", "text": "describe these inputs"},
+                    {"type": "image_url", "image_url": {"url": "data:image/png;base64,AAA"}},
+                    {"type": "video_url", "video_url": {"url": "data:video/mp4;base64,BBB"}},
+                    {"type": "audio_url", "audio_url": {"url": "data:audio/wav;base64,CCC"}},
+                    {"type": "input_audio", "input_audio": {"data": "DDD", "format": "wav"}}
+                ]
+            }],
+            "max_tokens": 8,
+            "stream": false
+        });
+
+        // Exactly what the PD router does: typed deserialize, then re-serialize
+        // to the Value handed to both legs.
+        let typed: ChatCompletionRequest =
+            serde_json::from_value(body.clone()).expect("media parts must deserialize");
+        let reemitted = serde_json::to_value(&typed).expect("must re-serialize");
+
+        let parts = &reemitted["messages"][0]["content"];
+        let kinds: Vec<&str> = parts
+            .as_array()
+            .expect("content must stay an array")
+            .iter()
+            .filter_map(|p| p.get("type").and_then(|t| t.as_str()))
+            .collect();
+        assert_eq!(
+            kinds,
+            vec!["text", "image_url", "video_url", "audio_url", "input_audio"],
+            "every media content-part kind must survive the PD serialization boundary"
+        );
+        // The media parts must be byte-identical to what the client sent (the
+        // struct may additionally materialize `#[serde(default)]` sampling
+        // fields on other parts of the body — unrelated to content parts).
+        assert_eq!(parts, &body["messages"][0]["content"]);
+    }
+
     // ========================================================================
     // Phase 1: Basic PD Components and Router Creation
     // ========================================================================

@@ -436,7 +436,10 @@ fn user_content_text(content: &UserMessageContent) -> Result<String> {
                     crate::protocols::spec::ContentPart::Text { text: part } => {
                         text.push_str(part);
                     }
-                    crate::protocols::spec::ContentPart::ImageUrl { .. } => {
+                    crate::protocols::spec::ContentPart::ImageUrl { .. }
+                    | crate::protocols::spec::ContentPart::VideoUrl { .. }
+                    | crate::protocols::spec::ContentPart::AudioUrl { .. }
+                    | crate::protocols::spec::ContentPart::InputAudio { .. } => {
                         return Err(anyhow!(
                             "multimodal chat is not supported by the token_ids-only gRPC path"
                         ));
