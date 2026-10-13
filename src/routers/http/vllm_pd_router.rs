@@ -1581,7 +1581,13 @@ impl VllmPDRouter {
                 Some(&request_id),
             )
             .await
-            .map_err(|reason| PDRouterError::InvalidConfiguration { reason })?;
+            .map_err(|reason| {
+                // decode_worker.increment_load() already ran when Stage 1 completed;
+                // releasing the decode slot before returning prevents a permanent
+                // load-accounting leak on every Mooncake handshake failure.
+                decode_worker.decrement_load();
+                PDRouterError::InvalidConfiguration { reason }
+            })?;
         if let Some(params) = decode_kv_params {
             decode_request["kv_transfer_params"] = params;
         }
