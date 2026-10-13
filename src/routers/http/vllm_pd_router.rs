@@ -191,6 +191,71 @@ impl VllmPDRouter {
         }
     }
 
+    /// Fail-fast validator for the Mooncake two-stage handshake.
+    ///
+    /// Mooncake PD keeps a prefill request open until the KV transfer it initiates
+    /// completes. If a required cross-leg parameter is absent, empty, or the wrong
+    /// type, the two legs never correlate: the prefill stays pending while both
+    /// engines report idle. Missing parameters used to be logged and ignored, so the
+    /// request hung; here they are rejected before dispatch.
+    ///
+    /// `stage` is `"prefill"` or `"decode"`. Only the cross-leg fields the router
+    /// itself builds are validated; happy-path params are returned unchanged.
+    fn validate_mooncake_handshake_params(stage: &str, params: &Value) -> Result<(), String> {
+        let (required_strings, required_bools): (&[&str], &[&str]) = match stage {
+            "prefill" => (&["transfer_id"], &["do_remote_decode"]),
+            "decode" => (
+                &["transfer_id", "remote_bootstrap_addr", "remote_engine_id"],
+                &["do_remote_prefill"],
+            ),
+            other => {
+                return Err(format!(
+                    "Mooncake handshake validation: unknown stage '{}'",
+                    other
+                ));
+            }
+        };
+
+        for field in required_strings {
+            match params.get(*field) {
+                Some(Value::String(s)) if !s.trim().is_empty() => {}
+                Some(Value::String(_)) => {
+                    return Err(format!(
+                        "Mooncake {} handshake: '{}' is empty; refusing to dispatch \
+                         (a blank handshake field leaves the KV transfer uncorrelated)",
+                        stage, field
+                    ));
+                }
+                Some(other) => {
+                    return Err(format!(
+                        "Mooncake {} handshake: '{}' must be a non-empty string, got {}",
+                        stage, field, other
+                    ));
+                }
+                None => {
+                    return Err(format!(
+                        "Mooncake {} handshake: required field '{}' is missing; refusing to dispatch",
+                        stage, field
+                    ));
+                }
+            }
+        }
+
+        for field in required_bools {
+            match params.get(*field) {
+                Some(Value::Bool(true)) => {}
+                _ => {
+                    return Err(format!(
+                        "Mooncake {} handshake: '{}' must be true",
+                        stage, field
+                    ));
+                }
+            }
+        }
+
+        Ok(())
+    }
+
     /// Build kv_transfer_params for the prefill request.
     ///
     /// Returns an error for MoRI-IO when no transfer mode has been registered yet, so that
@@ -202,11 +267,15 @@ impl VllmPDRouter {
         decode_dp_rank: Option<usize>,
     ) -> Result<Value, String> {
         match self.kv_connector {
-            KvConnector::Mooncake => Ok(json!({
-                "do_remote_decode": true,
-                "do_remote_prefill": false,
-                "transfer_id": transfer_id.unwrap_or(""),
-            })),
+            KvConnector::Mooncake => {
+                let params = json!({
+                    "do_remote_decode": true,
+                    "do_remote_prefill": false,
+                    "transfer_id": transfer_id.unwrap_or(""),
+                });
+                Self::validate_mooncake_handshake_params("prefill", &params)?;
+                Ok(params)
+            }
             KvConnector::MoriIO => {
                 let mode = self.moriio_transfer_mode().ok_or_else(|| {
                     "No MoRI-IO instances have registered a transfer mode; \
@@ -259,8 +328,13 @@ impl VllmPDRouter {
         }
     }
 
-    /// Build decode kv_transfer_params for all connectors. Returns `None` if params cannot be
-    /// determined (e.g. Mooncake bootstrap info missing, or no kv_transfer_params in prefill response).
+    /// Build decode kv_transfer_params for all connectors.
+    ///
+    /// Returns `Ok(None)` when params cannot be determined for a connector that tolerates
+    /// their absence (e.g. no kv_transfer_params in the prefill response for MoRI-IO READ
+    /// or NIXL pull mode). For Mooncake, missing bootstrap info or an incomplete handshake
+    /// is an error: the decode leg must be dispatched with correlated parameters or the
+    /// prefill request stays pending until it hangs.
     async fn build_decode_kv_transfer_params(
         &self,
         prefill_url: &str,
@@ -268,24 +342,26 @@ impl VllmPDRouter {
         transfer_id: Option<&str>,
         prefill_dp_rank: Option<u32>,
         request_id: Option<&str>,
-    ) -> Option<Value> {
+    ) -> Result<Option<Value>, String> {
         match self.kv_connector {
             KvConnector::Mooncake => {
                 let Some((bootstrap_addr, engine_id)) = self
                     .get_mooncake_info(prefill_url, prefill_dp_rank.map(|r| r as usize))
                     .await
                 else {
-                    warn!(
-                        "No Mooncake bootstrap info for prefill {}, decode will proceed without kv_transfer_params",
+                    return Err(format!(
+                        "Mooncake decode handshake: no bootstrap info registered for prefill {}; \
+                         refusing to dispatch decode (the prefill request would hang)",
                         prefill_url
-                    );
-                    return None;
+                    ));
                 };
-                Some(self.build_mooncake_decode_kv_transfer_params(
+                let params = self.build_mooncake_decode_kv_transfer_params(
                     transfer_id.unwrap_or(""),
                     &bootstrap_addr,
                     &engine_id,
-                ))
+                );
+                Self::validate_mooncake_handshake_params("decode", &params)?;
+                Ok(Some(params))
             }
             KvConnector::MoriIO => {
                 if matches!(self.moriio_transfer_mode(), Some(MoriIOTransferMode::Write)) {
@@ -310,27 +386,40 @@ impl VllmPDRouter {
                             params["remote_dp_rank"] = json!(rank);
                         }
                     }
-                    Some(params)
+                    Ok(Some(params))
                 } else {
                     // READ mode: extract params from prefill response and inject remote_dp_size.
-                    let mut params = prefill_response_json?.get("kv_transfer_params")?.clone();
+                    let Some(response) = prefill_response_json else {
+                        return Ok(None);
+                    };
+                    let Some(kvt) = response.get("kv_transfer_params") else {
+                        return Ok(None);
+                    };
+                    let mut params = kvt.clone();
                     params["remote_dp_size"] = json!(self.intra_node_data_parallel_size);
-                    Some(params)
+                    Ok(Some(params))
                 }
             }
             KvConnector::Nixl => {
                 if let Some(json) = prefill_response_json {
-                    let kvt = json.get("kv_transfer_params")?;
+                    let Some(kvt) = json.get("kv_transfer_params") else {
+                        return Ok(None);
+                    };
                     if !Self::is_nixl_push_mode(kvt) {
-                        return Some(kvt.clone());
+                        return Ok(Some(kvt.clone()));
                     }
                 }
-                let identity = self.ensure_nixl_push_identity(
+                let Some(identity) = self.ensure_nixl_push_identity(
                     prefill_url,
                     prefill_dp_rank.map(|r| r as usize),
                     prefill_response_json,
-                )?;
-                Some(Self::build_nixl_push_decode_params(&identity, request_id?))
+                ) else {
+                    return Ok(None);
+                };
+                let Some(request_id) = request_id else {
+                    return Ok(None);
+                };
+                Ok(Some(Self::build_nixl_push_decode_params(&identity, request_id)))
             }
         }
     }
@@ -1038,7 +1127,7 @@ impl VllmPDRouter {
 
         // Prepare decode request
         let mut decode_request = request_json.clone();
-        if let Some(params) = self
+        let decode_kv_params = self
             .build_decode_kv_transfer_params(
                 &prefill_url_key,
                 prefill_response_json.as_ref(),
@@ -1046,12 +1135,13 @@ impl VllmPDRouter {
                 prefill_dp_rank.map(|r| r as u32),
                 Some(&request_id),
             )
-            .await
-        {
+            .await;
+        if let Some(params) = decode_kv_params? {
             decode_request["kv_transfer_params"] = params;
+        } else {
             debug!(
-                "Added kv_transfer_params to decode request for {:?} connector",
-                self.kv_connector
+                "No kv_transfer_params for prefill {}, decode will proceed without them",
+                prefill_url_key
             );
         }
 
@@ -1482,7 +1572,7 @@ impl VllmPDRouter {
 
         // Stage 2: Prepare decode request with kv_transfer_params
         let mut decode_request = original_request.clone();
-        if let Some(params) = self
+        let decode_kv_params = self
             .build_decode_kv_transfer_params(
                 &prefill_base_url,
                 Some(&prefill_response_json),
@@ -1491,13 +1581,9 @@ impl VllmPDRouter {
                 Some(&request_id),
             )
             .await
-        {
+            .map_err(|reason| PDRouterError::InvalidConfiguration { reason })?;
+        if let Some(params) = decode_kv_params {
             decode_request["kv_transfer_params"] = params;
-        } else {
-            warn!(
-                "No kv_transfer_params for prefill {}, decode will proceed without them",
-                prefill_base_url
-            );
         }
 
         // Use endpoint_url() to get the base URL without @rank suffix,
@@ -2988,5 +3074,142 @@ mod tests {
     fn test_moriio_write_decode_params_includes_remote_dp_rank_when_dp_size_gt_1() {
         let params = moriio_write_decode_params(Some("tx-abc"), 4, Some(2));
         assert_eq!(params["remote_dp_rank"], 2);
+    }
+
+    // --- Mooncake handshake fail-fast validation (R2) ---
+    //
+    // Mooncake PD keeps a prefill request open until the KV transfer it initiates completes;
+    // a missing or malformed cross-leg handshake field leaves it pending while both engines
+    // look idle. The validator below is what build_prefill_kv_transfer_params (prefill arm)
+    // and build_decode_kv_transfer_params (Mooncake arm) call before returning, so a missing
+    // param now returns a Err instead of the previous warn-then-proceed hang.
+
+    #[test]
+    fn test_mooncake_prefill_params_missing_transfer_id_fails_fast() {
+        let params = json!({
+            "do_remote_decode": true,
+            "do_remote_prefill": false,
+            // transfer_id absent on purpose
+        });
+        let err = VllmPDRouter::validate_mooncake_handshake_params("prefill", &params)
+            .unwrap_err();
+        assert!(err.contains("transfer_id"), "{err}");
+        assert!(err.contains("missing"), "{err}");
+    }
+
+    #[test]
+    fn test_mooncake_prefill_params_empty_transfer_id_fails_fast() {
+        let params = json!({
+            "do_remote_decode": true,
+            "do_remote_prefill": false,
+            "transfer_id": "",
+        });
+        let err = VllmPDRouter::validate_mooncake_handshake_params("prefill", &params)
+            .unwrap_err();
+        assert!(err.contains("transfer_id"), "{err}");
+        assert!(err.contains("empty"), "{err}");
+    }
+
+    #[test]
+    fn test_mooncake_prefill_params_do_remote_decode_false_fails_fast() {
+        let params = json!({
+            "do_remote_decode": false,
+            "do_remote_prefill": false,
+            "transfer_id": "xfer-abc",
+        });
+        let err = VllmPDRouter::validate_mooncake_handshake_params("prefill", &params)
+            .unwrap_err();
+        assert!(err.contains("do_remote_decode"), "{err}");
+        assert!(err.contains("must be true"), "{err}");
+    }
+
+    #[test]
+    fn test_mooncake_prefill_params_valid_passes() {
+        let params = json!({
+            "do_remote_decode": true,
+            "do_remote_prefill": false,
+            "transfer_id": "xfer-abc",
+        });
+        assert!(VllmPDRouter::validate_mooncake_handshake_params("prefill", &params).is_ok());
+    }
+
+    #[test]
+    fn test_mooncake_decode_params_missing_bootstrap_addr_fails_fast() {
+        let params = json!({
+            "do_remote_decode": false,
+            "do_remote_prefill": true,
+            "transfer_id": "xfer-abc",
+            "remote_engine_id": "engine-1",
+            // remote_bootstrap_addr absent on purpose
+        });
+        let err = VllmPDRouter::validate_mooncake_handshake_params("decode", &params)
+            .unwrap_err();
+        assert!(err.contains("remote_bootstrap_addr"), "{err}");
+        assert!(err.contains("missing"), "{err}");
+    }
+
+    #[test]
+    fn test_mooncake_decode_params_missing_engine_id_fails_fast() {
+        let params = json!({
+            "do_remote_decode": false,
+            "do_remote_prefill": true,
+            "transfer_id": "xfer-abc",
+            "remote_bootstrap_addr": "http://1.2.3.4:8998",
+            // remote_engine_id absent on purpose
+        });
+        let err = VllmPDRouter::validate_mooncake_handshake_params("decode", &params)
+            .unwrap_err();
+        assert!(err.contains("remote_engine_id"), "{err}");
+        assert!(err.contains("missing"), "{err}");
+    }
+
+    #[test]
+    fn test_mooncake_decode_params_do_remote_prefill_false_fails_fast() {
+        let params = json!({
+            "do_remote_decode": false,
+            "do_remote_prefill": false,
+            "transfer_id": "xfer-abc",
+            "remote_bootstrap_addr": "http://1.2.3.4:8998",
+            "remote_engine_id": "engine-1",
+        });
+        let err = VllmPDRouter::validate_mooncake_handshake_params("decode", &params)
+            .unwrap_err();
+        assert!(err.contains("do_remote_prefill"), "{err}");
+        assert!(err.contains("must be true"), "{err}");
+    }
+
+    #[test]
+    fn test_mooncake_decode_params_valid_passes() {
+        let params = json!({
+            "do_remote_decode": false,
+            "do_remote_prefill": true,
+            "transfer_id": "xfer-abc",
+            "remote_bootstrap_addr": "http://1.2.3.4:8998",
+            "remote_engine_id": "engine-1",
+        });
+        assert!(VllmPDRouter::validate_mooncake_handshake_params("decode", &params).is_ok());
+    }
+
+    #[test]
+    fn test_mooncake_decode_params_empty_engine_id_fails_fast() {
+        let params = json!({
+            "do_remote_decode": false,
+            "do_remote_prefill": true,
+            "transfer_id": "xfer-abc",
+            "remote_bootstrap_addr": "http://1.2.3.4:8998",
+            "remote_engine_id": "   ",
+        });
+        let err = VllmPDRouter::validate_mooncake_handshake_params("decode", &params)
+            .unwrap_err();
+        assert!(err.contains("remote_engine_id"), "{err}");
+        assert!(err.contains("empty"), "{err}");
+    }
+
+    #[test]
+    fn test_mooncake_handshake_unknown_stage_fails_fast() {
+        let params = json!({});
+        let err = VllmPDRouter::validate_mooncake_handshake_params("bogus", &params)
+            .unwrap_err();
+        assert!(err.contains("unknown stage"), "{err}");
     }
 }
