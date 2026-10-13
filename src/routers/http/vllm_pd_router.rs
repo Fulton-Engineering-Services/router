@@ -1539,7 +1539,7 @@ impl VllmPDRouter {
         {
             Ok(resp) => resp,
             Err(e @ PDRouterError::Timeout { .. }) => {
-                prefill_worker.decrement_load();
+                // prefill guard drops here, decrementing the load
                 let duration = start_time.elapsed();
                 RouterMetrics::record_pd_prefill_error(&prefill_base_url);
                 RouterMetrics::record_pd_request(path);
@@ -1631,10 +1631,7 @@ impl VllmPDRouter {
             )
             .await
             .map_err(|reason| {
-                // decode_worker.increment_load() already ran when Stage 1 completed;
-                // releasing the decode slot before returning prevents a permanent
-                // load-accounting leak on every Mooncake handshake failure.
-                decode_worker.decrement_load();
+                // decode guard drops here, decrementing the load
                 PDRouterError::InvalidConfiguration { reason }
             })?;
         if let Some(params) = decode_kv_params {
@@ -1704,7 +1701,7 @@ impl VllmPDRouter {
         {
             Ok(resp) => resp,
             Err(e @ PDRouterError::Timeout { .. }) => {
-                decode_worker.decrement_load();
+                // decode guard drops here, decrementing the load
                 let duration = start_time.elapsed();
                 RouterMetrics::record_pd_decode_error(&decode_base_url);
                 RouterMetrics::record_pd_request(path);
