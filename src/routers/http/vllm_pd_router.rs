@@ -1684,28 +1684,71 @@ impl VllmPDRouter {
         decode_worker: &Arc<dyn Worker>,
         path: &str,
     ) -> Option<(Value, Value, String)> {
-        if !matches!(self.kv_connector, KvConnector::Nixl) {
-            return None;
-        }
-
+        // Two-leg (concurrent) dispatch is only safe when the decode request's
+        // kv_transfer_params can be fully determined *before* the prefill response
+        // arrives, because both legs are dispatched together via `tokio::join!` in
+        // `process_concurrent_two_stage`. That holds for:
+        //   * NIXL push mode: the decode identity is cached from a prior prefill or
+        //     discovery response (`get_nixl_push_identity`), and
+        //   * Mooncake: `remote_bootstrap_addr`/`remote_engine_id` come from the
+        //     router-startup bootstrap query (`query_mooncake_bootstrap`), never from
+        //     the prefill response.
+        // Both of these connectors hold the prefill request open until its KV transfer
+        // completes (the transfer only progresses once decode is running), so awaiting
+        // prefill before issuing decode deadlocks. The legs must be dispatched together.
         let prefill_base_url = prefill_worker.base_url().to_string();
         let prefill_dp_rank = prefill_worker.dp_rank();
-        let identity = self.get_nixl_push_identity(&prefill_base_url, prefill_dp_rank)?;
+        let decode_base_url = decode_worker.base_url().to_string();
 
         let prefill_zmq_addr =
             self.get_zmq_address(prefill_worker.base_url(), ServiceType::Prefill);
         let decode_zmq_addr = self.get_zmq_address(decode_worker.base_url(), ServiceType::Decode);
         let request_id = Self::generate_vllm_request_id(&prefill_zmq_addr, &decode_zmq_addr);
 
-        let decode_base_url = decode_worker.base_url().to_string();
+        let (prefill_kvt, decode_kvt) = match self.kv_connector {
+            KvConnector::Nixl => {
+                let identity = self.get_nixl_push_identity(&prefill_base_url, prefill_dp_rank)?;
+                (
+                    self.build_prefill_kv_transfer_params(
+                        None,
+                        Some(&decode_base_url),
+                        decode_worker.dp_rank(),
+                    )
+                    .ok()?,
+                    Self::build_nixl_push_decode_params(&identity, &request_id),
+                )
+            }
+            KvConnector::Mooncake => {
+                // Require the startup-discovered bootstrap info so a Mooncake decode leg
+                // is never dispatched without its KV handshake fields; if it is missing,
+                // fall back to the sequential path (same behaviour as before).
+                let (bootstrap_addr, engine_id) =
+                    self.get_mooncake_info(&prefill_base_url, prefill_dp_rank).await?;
+                let transfer_id = self.generate_transfer_id();
+                (
+                    self.build_prefill_kv_transfer_params(
+                        transfer_id.as_deref(),
+                        Some(&decode_base_url),
+                        decode_worker.dp_rank(),
+                    )
+                    .ok()?,
+                    self.build_mooncake_decode_kv_transfer_params(
+                        transfer_id.as_deref().unwrap_or(""),
+                        &bootstrap_addr,
+                        &engine_id,
+                    ),
+                )
+            }
+            // MoRI-IO is dispatched via its own READ/WRITE branches in
+            // `process_vllm_two_stage_request_discovered`, not this path.
+            KvConnector::MoriIO => return None,
+        };
+
         let mut prefill_request = Self::prepare_prefill_request(original_request.clone(), path);
-        prefill_request["kv_transfer_params"] = self
-            .build_prefill_kv_transfer_params(None, Some(&decode_base_url), decode_worker.dp_rank())
-            .ok()?;
+        prefill_request["kv_transfer_params"] = prefill_kvt;
 
         let mut decode_request = original_request.clone();
-        decode_request["kv_transfer_params"] =
-            Self::build_nixl_push_decode_params(&identity, &request_id);
+        decode_request["kv_transfer_params"] = decode_kvt;
 
         Some((prefill_request, decode_request, request_id))
     }
