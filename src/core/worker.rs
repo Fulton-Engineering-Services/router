@@ -855,6 +855,35 @@ impl<'a> Drop for WorkerLoadGuard<'a> {
     }
 }
 
+/// Owned RAII guard for worker load management.
+///
+/// Unlike [`WorkerLoadGuard`] (which borrows `&'a dyn Worker`), this guard
+/// owns `Arc<dyn Worker>` clones and can be held across `.await` points in
+/// async request handlers. `Drop` decrements the load counter even when the
+/// request future is cancelled or dropped mid-flight (e.g. a wedged two-stage
+/// PD leg), so the worker's reported load never leaks.
+pub struct OwnedWorkerLoadGuard {
+    workers: Vec<Arc<dyn Worker>>,
+}
+
+impl OwnedWorkerLoadGuard {
+    /// Increment the worker's load and return a guard that decrements on drop.
+    pub fn new(worker: Arc<dyn Worker>) -> Self {
+        worker.increment_load();
+        Self {
+            workers: vec![worker],
+        }
+    }
+}
+
+impl Drop for OwnedWorkerLoadGuard {
+    fn drop(&mut self) {
+        for worker in &self.workers {
+            worker.decrement_load();
+        }
+    }
+}
+
 /// Health checker handle with graceful shutdown
 pub struct HealthChecker {
     handle: tokio::task::JoinHandle<()>,
@@ -1967,5 +1996,71 @@ mod tests {
             }
         );
         assert_eq!(workers[5].worker_type(), WorkerType::Decode);
+    }
+    // Test OwnedWorkerLoadGuard (cancellation-safe)
+    #[test]
+    fn test_owned_load_guard_single_worker() {
+        let worker: Arc<dyn Worker> = Arc::new(BasicWorker::new(
+            "http://test:8080".to_string(),
+            WorkerType::Regular,
+        ));
+        assert_eq!(worker.load(), 0);
+
+        {
+            let _guard = OwnedWorkerLoadGuard::new(Arc::clone(&worker));
+            assert_eq!(worker.load(), 1);
+        }
+
+        assert_eq!(worker.load(), 0);
+    }
+
+    #[test]
+    fn test_owned_load_guard_panic_safety() {
+        let worker: Arc<dyn Worker> = Arc::new(BasicWorker::new(
+            "http://test:8080".to_string(),
+            WorkerType::Regular,
+        ));
+        assert_eq!(worker.load(), 0);
+
+        let worker_clone = Arc::clone(&worker);
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _guard = OwnedWorkerLoadGuard::new(Arc::clone(&worker_clone));
+            assert_eq!(worker_clone.load(), 1);
+            panic!("Test panic");
+        }));
+
+        assert!(result.is_err());
+        assert_eq!(worker.load(), 0);
+    }
+
+    #[tokio::test]
+    async fn test_owned_load_guard_releases_on_future_cancellation() {
+        let worker: Arc<dyn Worker> = Arc::new(BasicWorker::new(
+            "http://test:8080".to_string(),
+            WorkerType::Regular,
+        ));
+        assert_eq!(worker.load(), 0);
+
+        let worker_clone = Arc::clone(&worker);
+        let handle = tokio::spawn(async move {
+            let _guard = OwnedWorkerLoadGuard::new(worker_clone);
+            std::future::pending::<()>().await;
+        });
+
+        // Wait for the task to start and increment load
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        assert_eq!(worker.load(), 1);
+
+        // Cancel the task -- guard Drop must decrement
+        handle.abort();
+        let _ = handle.await;
+
+        tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            while worker.load() != 0 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("load not decremented after cancellation");
     }
 }

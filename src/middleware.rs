@@ -490,6 +490,59 @@ impl ConcurrencyLimiter {
     }
 }
 
+
+/// RAII guard for a concurrency-limiter token.
+///
+/// The token is returned on the normal-completion path via an explicit, awaited
+/// [] call so the ordering with downstream metrics and
+/// response handling is unchanged. If the request future is dropped/cancelled
+/// before `release` runs (e.g. a never-completing PD two-stage leg), `Drop`
+/// returns the token via the non-async [`TokenBucket::try_return_tokens`] path,
+/// with a detached async fallback when the bucket lock is contended, so a
+/// wedged handler cannot leak limiter capacity.
+struct TokenGuard {
+    token_bucket: Arc<TokenBucket>,
+    released: bool,
+}
+
+impl TokenGuard {
+    fn new(token_bucket: Arc<TokenBucket>) -> Self {
+        Self {
+            token_bucket,
+            released: false,
+        }
+    }
+
+    async fn release(&mut self) {
+        if !self.released {
+            self.released = true;
+            self.token_bucket.return_tokens(1.0).await;
+        }
+    }
+}
+
+impl Drop for TokenGuard {
+    fn drop(&mut self) {
+        if self.released {
+            return;
+        }
+        self.released = true;
+        if !self.token_bucket.try_return_tokens(1.0) {
+            // The bucket lock is contended (another task is mid-acquire/refill).
+            // Hand the return to a detached task so the token is not lost.
+            let bucket = Arc::clone(&self.token_bucket);
+            if let Ok(handle) = tokio::runtime::Handle::try_current() {
+                handle.spawn(async move {
+                    bucket.return_tokens(1.0).await;
+                });
+            } else {
+                // No runtime: last-resort blocking return so we never leak.
+                let _ = self.token_bucket.try_return_tokens(1.0);
+            }
+        }
+    }
+}
+
 /// Middleware function for concurrency limiting with optional queuing
 pub async fn concurrency_limit_middleware(
     State(app_state): State<Arc<AppState>>,
@@ -506,11 +559,9 @@ pub async fn concurrency_limit_middleware(
     // Try to acquire token immediately
     if token_bucket.try_acquire(1.0).await.is_ok() {
         debug!("Acquired token immediately");
+        let mut guard = TokenGuard::new(Arc::clone(&token_bucket));
         let response = next.run(request).await;
-
-        // Return the token to the bucket
-        token_bucket.return_tokens(1.0).await;
-
+        guard.release().await;
         response
     } else {
         // No tokens available, try to queue if enabled
@@ -545,11 +596,9 @@ pub async fn concurrency_limit_middleware(
                                 RouterMetrics::set_embeddings_queue_size(new_val as usize);
                             }
 
+                            let mut guard = TokenGuard::new(Arc::clone(&token_bucket));
                             let response = next.run(request).await;
-
-                            // Return the token to the bucket
-                            token_bucket.return_tokens(1.0).await;
-
+                            guard.release().await;
                             response
                         }
                         Ok(Err(status)) => {
@@ -583,5 +632,80 @@ pub async fn concurrency_limit_middleware(
             warn!("No tokens available and queuing is disabled, returning 429");
             StatusCode::TOO_MANY_REQUESTS.into_response()
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::core::{BasicWorker, OwnedWorkerLoadGuard, Worker, WorkerType};
+
+    #[tokio::test]
+    async fn token_guard_releases_on_normal_drop() {
+        let bucket = Arc::new(TokenBucket::new(1, 1));
+        assert!(bucket.try_acquire(1.0).await.is_ok());
+        {
+            let mut guard = TokenGuard::new(Arc::clone(&bucket));
+            assert!(bucket.try_acquire(1.0).await.is_err());
+            guard.release().await;
+        }
+        assert!(bucket.try_acquire(1.0).await.is_ok());
+    }
+
+    #[tokio::test]
+    async fn token_guard_releases_on_cancellation() {
+        let bucket = Arc::new(TokenBucket::new(1, 1));
+        let bucket_clone = Arc::clone(&bucket);
+        let handle = tokio::spawn(async move {
+            // Mirror the middleware order: acquire, then wrap in the guard.
+            assert!(bucket_clone.try_acquire(1.0).await.is_ok());
+            let _guard = TokenGuard::new(bucket_clone);
+            std::future::pending::<()>().await;
+        });
+        tokio::task::yield_now().await;
+        assert!(bucket.try_acquire(1.0).await.is_err());
+        handle.abort();
+        let _ = handle.await;
+        tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            loop {
+                if bucket.try_acquire(1.0).await.is_ok() {
+                    return;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("token not returned after cancellation");
+    }
+
+    #[tokio::test]
+    async fn cancelled_handler_releases_token_and_load() {
+        let bucket = Arc::new(TokenBucket::new(1, 1));
+        let worker: Arc<dyn Worker> = Arc::new(BasicWorker::new(
+            "http://test:8080".to_string(),
+            WorkerType::Regular,
+        ));
+        let bucket_clone = Arc::clone(&bucket);
+        let worker_clone = Arc::clone(&worker);
+        let handle = tokio::spawn(async move {
+            // Mirror the middleware order: acquire, then wrap in the guard.
+            assert!(bucket_clone.try_acquire(1.0).await.is_ok());
+            let _token = TokenGuard::new(bucket_clone);
+            let _load = OwnedWorkerLoadGuard::new(worker_clone);
+            std::future::pending::<()>().await;
+        });
+        tokio::task::yield_now().await;
+        assert!(bucket.try_acquire(1.0).await.is_err());
+        assert_eq!(worker.load(), 1);
+        handle.abort();
+        let _ = handle.await;
+        tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            while bucket.try_acquire(1.0).await.is_err() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("token not released after cancellation");
+        assert_eq!(worker.load(), 0, "load not decremented after cancellation");
     }
 }

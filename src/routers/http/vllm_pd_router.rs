@@ -6,7 +6,7 @@ use super::pd_router::PdRouterBase;
 use super::pd_types::{error_chain, PDRouterError};
 use super::vllm_service_discovery::{MoriIOTransferMode, ServiceRegistry, ServiceType};
 use crate::config::KvConnector;
-use crate::core::{BasicWorker, Worker, WorkerType};
+use crate::core::{BasicWorker, OwnedWorkerLoadGuard, Worker, WorkerType};
 use crate::metrics::RouterMetrics;
 use crate::otel_http::{self, ClientRequestOptions};
 use crate::policies::PolicyRegistry;
@@ -1312,8 +1312,9 @@ impl VllmPDRouter {
             path
         );
 
-        // Increment prefill load at the start of the prefill phase
-        prefill_worker.increment_load();
+        // Increment prefill load at the start of the prefill phase. The guard
+        // decrements it on drop, so a cancelled request future still releases it.
+        let _prefill_guard = OwnedWorkerLoadGuard::new(Arc::clone(&prefill_worker));
 
         let prefill_zmq_addr =
             self.get_zmq_address(prefill_worker.base_url(), ServiceType::Prefill);
@@ -1408,7 +1409,7 @@ impl VllmPDRouter {
         {
             Ok(resp) => resp,
             Err(e) => {
-                prefill_worker.decrement_load();
+                // prefill guard drops here, decrementing the load
                 let full_error = error_chain(&e);
                 let duration = start_time.elapsed();
                 RouterMetrics::record_pd_prefill_error(&prefill_base_url);
@@ -1430,7 +1431,7 @@ impl VllmPDRouter {
         let prefill_bytes = match prefill_response.bytes().await {
             Ok(bytes) => bytes,
             Err(e) => {
-                prefill_worker.decrement_load();
+                // prefill guard drops here, decrementing the load
                 let full_error = error_chain(&e);
                 let duration = start_time.elapsed();
                 RouterMetrics::record_pd_prefill_error(&prefill_base_url);
@@ -1460,7 +1461,7 @@ impl VllmPDRouter {
         let prefill_response_json: Value = match serde_json::from_slice(&prefill_bytes) {
             Ok(json) => json,
             Err(e) => {
-                prefill_worker.decrement_load();
+                // prefill guard drops here, decrementing the load
                 let duration = start_time.elapsed();
                 RouterMetrics::record_pd_prefill_error(&prefill_base_url);
                 RouterMetrics::record_pd_request(path);
@@ -1474,9 +1475,9 @@ impl VllmPDRouter {
         // Stop profiling on prefill server after its work is done
         self.stop_profiling(&prefill_base_url).await;
 
-        // Prefill phase complete: decrement prefill load, increment decode load
-        prefill_worker.decrement_load();
-        decode_worker.increment_load();
+        // Prefill phase complete: release prefill load, take decode load via guard
+        drop(_prefill_guard);
+        let _decode_guard = OwnedWorkerLoadGuard::new(Arc::clone(&decode_worker));
 
         debug!("✅ vLLM Stage 1 completed, starting Stage 2 - Decode");
 
@@ -1558,7 +1559,7 @@ impl VllmPDRouter {
         {
             Ok(resp) => resp,
             Err(e) => {
-                decode_worker.decrement_load();
+                // decode guard drops here, decrementing the load
                 let full_error = error_chain(&e);
                 let duration = start_time.elapsed();
                 RouterMetrics::record_pd_decode_error(&decode_base_url);
@@ -1574,8 +1575,7 @@ impl VllmPDRouter {
         // Stop profiling on decode server after response received
         self.stop_profiling(&decode_base_url).await;
 
-        // Decode phase complete: decrement decode load
-        decode_worker.decrement_load();
+        // Decode phase complete: decode guard drops at end of scope
 
         let status = decode_response.status();
         let headers = decode_response.headers().clone();
@@ -1744,8 +1744,8 @@ impl VllmPDRouter {
             )
         };
 
-        prefill_worker.increment_load();
-        decode_worker.increment_load();
+        let _prefill_guard = OwnedWorkerLoadGuard::new(Arc::clone(&prefill_worker));
+        let _decode_guard = OwnedWorkerLoadGuard::new(Arc::clone(&decode_worker));
         self.start_profiling(&prefill_base_url).await;
         self.start_profiling(&decode_base_url).await;
 
@@ -1772,7 +1772,7 @@ impl VllmPDRouter {
             ),
         );
 
-        prefill_worker.decrement_load();
+        drop(_prefill_guard);
         self.stop_profiling(&prefill_base_url).await;
 
         let prefill_response_json = match prefill_result {
@@ -1782,7 +1782,7 @@ impl VllmPDRouter {
                 .ok()
                 .and_then(|b| serde_json::from_slice::<Value>(&b).ok()),
             Ok(resp) => {
-                decode_worker.decrement_load();
+                // decode guard drops here, decrementing the load
                 self.stop_profiling(&decode_base_url).await;
                 RouterMetrics::record_pd_prefill_error(&prefill_base_url);
                 RouterMetrics::record_pd_request(path);
@@ -1796,7 +1796,7 @@ impl VllmPDRouter {
                 });
             }
             Err(e) => {
-                decode_worker.decrement_load();
+                // decode guard drops here, decrementing the load
                 self.stop_profiling(&decode_base_url).await;
                 RouterMetrics::record_pd_prefill_error(&prefill_base_url);
                 RouterMetrics::record_pd_request(path);
@@ -1817,7 +1817,7 @@ impl VllmPDRouter {
         let decode_response = match decode_result {
             Ok(resp) => resp,
             Err(e) => {
-                decode_worker.decrement_load();
+                // decode guard drops here, decrementing the load
                 self.stop_profiling(&decode_base_url).await;
                 RouterMetrics::record_pd_decode_error(&decode_base_url);
                 RouterMetrics::record_pd_request(path);
@@ -1832,7 +1832,7 @@ impl VllmPDRouter {
                 });
             }
         };
-        decode_worker.decrement_load();
+        // decode guard drops at end of scope
 
         let needs_logprobs = decode_request.get("logprobs").is_some()
             || decode_request

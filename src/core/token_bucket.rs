@@ -140,6 +140,24 @@ impl TokenBucket {
         );
     }
 
+    /// Return tokens without awaiting, for use from `Drop`/synchronous paths.
+    ///
+    /// Credits the tokens immediately when the bucket lock is uncontended and
+    /// notifies any waiters; returns `true`. If the lock is currently held
+    /// (another task is mid-acquire/refill) it leaves the tokens uncredited and
+    /// returns `false`, so the caller can arrange an asynchronous return.
+    pub fn try_return_tokens(&self, tokens: f64) -> bool {
+        match self.inner.try_lock() {
+            Ok(mut inner) => {
+                inner.tokens = (inner.tokens + tokens).min(self.capacity);
+                drop(inner);
+                self.notify.notify_waiters();
+                true
+            }
+            Err(_) => false,
+        }
+    }
+
     /// Get current available tokens (for monitoring)
     pub async fn available_tokens(&self) -> f64 {
         let mut inner = self.inner.lock().await;
