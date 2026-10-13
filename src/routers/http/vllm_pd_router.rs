@@ -21,6 +21,7 @@ use axum::{
 use serde_json::{json, Value};
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicUsize, Ordering};
+use std::future::Future;
 use std::sync::{Arc, RwLock};
 use std::time::Instant;
 use tokio::sync::Mutex;
@@ -69,6 +70,15 @@ pub struct VllmPDRouter {
 /// Must match `MoRIIOConstants.TRANSFER_PREFIX` in the vLLM Python connector.
 const MORIIO_TRANSFER_PREFIX: &str = "tx";
 
+/// Per-request deadline for each leg of the vLLM PD two-stage flow.
+///
+/// Bounds the await on a single prefill or decode leg so a stalled engine aborts
+/// the request with a descriptive timeout instead of blocking until the shared
+/// HTTP client timeout (`request_timeout_secs`, default 1800s). This is a
+/// time-to-response bound: a successful leg returns once response headers arrive
+/// and the body is streamed afterwards, so long generations are not cut off.
+const PD_STAGE_TIMEOUT_SECS: u64 = 300;
+
 /// Discovery-backed P/D routing is ready only after both worker types register.
 /// Without this guard, `PdRouterBase::health` sees the unused static registry and
 /// reports success before a discovered prefill/decode pair can serve requests.
@@ -88,6 +98,31 @@ fn build_prefill_request_builder(
         .header("Content-Type", "application/json")
         .header("X-Request-Id", request_id);
     dp_utils::add_dp_rank_header(builder, dp_rank)
+}
+
+/// Await one PD leg (prefill or decode) under `deadline`.
+///
+/// On timeout this returns a descriptive [`PDRouterError::Timeout`] naming the
+/// stage and URL. Network failures map to the same message shape callers
+/// previously built, so only the stalled path changes behaviour.
+async fn with_pd_leg_deadline<F>(
+    stage: &str,
+    url: &str,
+    deadline: std::time::Duration,
+    leg: F,
+) -> Result<reqwest::Response, PDRouterError>
+where
+    F: Future<Output = Result<reqwest::Response, reqwest::Error>>,
+{
+    match tokio::time::timeout(deadline, leg).await {
+        Ok(Ok(response)) => Ok(response),
+        Ok(Err(e)) => Err(PDRouterError::NetworkError {
+            message: format!("{} request failed to {}: {}", stage, url, error_chain(&e)),
+        }),
+        Err(_elapsed) => Err(PDRouterError::Timeout {
+            url: format!("{} leg {} (deadline {}s)", stage, url, deadline.as_secs()),
+        }),
+    }
 }
 
 impl VllmPDRouter {
@@ -1394,19 +1429,32 @@ impl VllmPDRouter {
         prefill_request_builder =
             dp_utils::add_dp_rank_header(prefill_request_builder, prefill_dp_rank);
 
-        let prefill_response = match otel_http::send_client_request(
-            prefill_request_builder.json(&prefill_request),
-            headers,
-            ClientRequestOptions {
-                method: "POST",
-                url: &prefill_url,
-                route: Some(path),
-                request_phase: Some("prefill"),
-            },
+        let prefill_response = match with_pd_leg_deadline(
+            "Prefill",
+            &prefill_url,
+            std::time::Duration::from_secs(PD_STAGE_TIMEOUT_SECS),
+            otel_http::send_client_request(
+                prefill_request_builder.json(&prefill_request),
+                headers,
+                ClientRequestOptions {
+                    method: "POST",
+                    url: &prefill_url,
+                    route: Some(path),
+                    request_phase: Some("prefill"),
+                },
+            ),
         )
         .await
         {
             Ok(resp) => resp,
+            Err(e @ PDRouterError::Timeout { .. }) => {
+                prefill_worker.decrement_load();
+                let duration = start_time.elapsed();
+                RouterMetrics::record_pd_prefill_error(&prefill_base_url);
+                RouterMetrics::record_pd_request(path);
+                RouterMetrics::record_pd_request_duration(path, duration);
+                return Err(e);
+            }
             Err(e) => {
                 prefill_worker.decrement_load();
                 let full_error = error_chain(&e);
@@ -1544,19 +1592,33 @@ impl VllmPDRouter {
         decode_request_builder =
             dp_utils::add_dp_rank_header(decode_request_builder, decode_dp_rank);
 
-        let decode_response = match otel_http::send_client_request(
-            decode_request_builder.json(&decode_request),
-            headers,
-            ClientRequestOptions {
-                method: "POST",
-                url: &decode_url,
-                route: Some(path),
-                request_phase: Some("decode"),
-            },
+        let decode_response = match with_pd_leg_deadline(
+            "Decode",
+            &decode_url,
+            std::time::Duration::from_secs(PD_STAGE_TIMEOUT_SECS),
+            otel_http::send_client_request(
+                decode_request_builder.json(&decode_request),
+                headers,
+                ClientRequestOptions {
+                    method: "POST",
+                    url: &decode_url,
+                    route: Some(path),
+                    request_phase: Some("decode"),
+                },
+            ),
         )
         .await
         {
             Ok(resp) => resp,
+            Err(e @ PDRouterError::Timeout { .. }) => {
+                decode_worker.decrement_load();
+                let duration = start_time.elapsed();
+                RouterMetrics::record_pd_decode_error(&decode_base_url);
+                RouterMetrics::record_pd_request(path);
+                RouterMetrics::record_pd_request_duration(path, duration);
+                RouterMetrics::record_pd_prefill_request(&prefill_base_url);
+                return Err(e);
+            }
             Err(e) => {
                 decode_worker.decrement_load();
                 let full_error = error_chain(&e);
@@ -2989,4 +3051,73 @@ mod tests {
         let params = moriio_write_decode_params(Some("tx-abc"), 4, Some(2));
         assert_eq!(params["remote_dp_rank"], 2);
     }
+
+    #[tokio::test]
+    async fn test_with_pd_leg_deadline_times_out_on_stalled_leg() {
+        let result = with_pd_leg_deadline(
+            "Prefill",
+            "http://prefill:8000/v1/completions",
+            std::time::Duration::from_millis(50),
+            std::future::pending(),
+        )
+        .await;
+        match result {
+            Err(PDRouterError::Timeout { url }) => {
+                assert!(url.contains("Prefill"));
+                assert!(url.contains("http://prefill:8000/v1/completions"));
+                assert!(url.contains("deadline 0s") || url.contains("deadline 50"));
+            }
+            other => panic!("expected Timeout, got {:?}", other),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_with_pd_leg_deadline_maps_network_error() {
+        // Real connection failure to a reserved port: reqwest::error::Kind is
+        // pub(crate), so an actual failing request is the only way to build one.
+        let leg = async {
+            reqwest::Client::new()
+                .get("http://127.0.0.1:1/")
+                .send()
+                .await
+        };
+        let result = with_pd_leg_deadline(
+            "Decode",
+            "http://decode:8000/v1/completions",
+            std::time::Duration::from_millis(50),
+            leg,
+        )
+        .await;
+        match result {
+            Err(PDRouterError::NetworkError { message }) => {
+                assert!(message.contains("Decode request failed to"));
+                assert!(message.contains("http://decode:8000/v1/completions"));
+            }
+            other => panic!("expected NetworkError, got {:?}", other),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_with_pd_leg_deadline_decodes_before_deadline_for_fast_leg() {
+        // A leg that fails quickly must not be interrupted by the deadline even
+        // when it is generous (5s >> the ~instant connection refusal).
+        let leg = async {
+            reqwest::Client::new()
+                .get("http://127.0.0.1:1/")
+                .send()
+                .await
+        };
+        let result = with_pd_leg_deadline(
+            "Decode",
+            "http://decode:8000/v1/completions",
+            std::time::Duration::from_secs(5),
+            leg,
+        )
+        .await;
+        assert!(matches!(
+            result,
+            Err(PDRouterError::NetworkError { .. })
+        ));
+    }
+
 }
